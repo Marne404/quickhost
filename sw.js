@@ -20,13 +20,42 @@ function getFile(db, key) {
   });
 }
 
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+// Die Upload-Seite selbst, damit sie auch offline läuft
+const CACHE = 'quickhost-shell-v1';
+const SHELL = ['./', 'index.html', 'jszip.min.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png']
+  .map(p => new URL(p, SCOPE).href);
+
+self.addEventListener('install', e => e.waitUntil(
+  caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())
+));
+self.addEventListener('activate', e => e.waitUntil((async () => {
+  // Nur eigene alte Caches löschen: der Cache-Speicher gilt für die ganze Origin
+  for (const key of await caches.keys()) {
+    if (key.startsWith('quickhost-') && key !== CACHE) await caches.delete(key);
+  }
+  await self.clients.claim();
+})()));
+
+// Erst Netzwerk (damit Updates ankommen), offline aus dem Cache
+async function shell(request, key) {
+  const cache = await caches.open(CACHE);
+  try {
+    const res = await fetch(request);
+    if (res.ok) await cache.put(key, res.clone());
+    return res;
+  } catch (e) {
+    const hit = await cache.match(key);
+    if (hit) return hit;
+    throw e;
+  }
+}
 
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
-  if (url.origin !== location.origin || !url.pathname.startsWith(PREFIX)) return;
-  event.respondWith(serve(url));
+  if (url.origin !== location.origin || event.request.method !== 'GET') return;
+  if (url.pathname.startsWith(PREFIX)) return event.respondWith(serve(url));
+  const key = url.origin + url.pathname;
+  if (SHELL.includes(key)) event.respondWith(shell(event.request, key));
 });
 
 async function serve(url) {

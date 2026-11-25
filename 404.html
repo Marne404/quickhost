@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="de">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Quick Host</title></head>
+<body style="font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px">
+<p id="msg">Seite nicht gefunden.</p>
+<p><a id="home" style="color:#38bdf8" href="/">Zur Startseite</a></p>
+<script>
+// Greift, wenn GitHub einen Projekt-Link beantwortet, weil der Service Worker nicht aktiv war
+(async () => {
+  const i = location.pathname.indexOf('/p/');
+  if (i === -1) return;
+  const base = location.pathname.slice(0, i + 1);
+  document.getElementById('home').href = base;
+  if (!('serviceWorker' in navigator)) return;
+  const mark = 'quickhost-retry:' + location.pathname;
+  if (sessionStorage.getItem(mark)) { sessionStorage.removeItem(mark); return; }
+  document.getElementById('msg').textContent = 'Lade Projekt …';
+  await navigator.serviceWorker.register(base + 'sw.js', { scope: base });
+  await navigator.serviceWorker.ready;
+  sessionStorage.setItem(mark, '1');
+  location.reload();
+})();
+</script>
+</body>
+</html>
