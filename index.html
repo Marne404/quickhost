@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quick Host</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    font-family: system-ui, sans-serif;
+    background: #0f172a; color: #e2e8f0;
+  }
+  .box { text-align: center; padding: 40px; max-width: 520px; width: 100%; }
+  h1 { margin-top: 0; font-weight: 600; }
+  .hint { color: #94a3b8; font-size: 14px; }
+  #drop {
+    border: 2px dashed #475569; border-radius: 16px;
+    padding: 40px 20px; transition: .2s;
+  }
+  #drop.over { border-color: #38bdf8; background: #1e293b; }
+  button {
+    background: #38bdf8; color: #0f172a; border: none;
+    padding: 14px 36px; font-size: 18px; font-weight: 600;
+    border-radius: 10px; cursor: pointer;
+  }
+  button:hover { background: #7dd3fc; }
+  #status { margin: 20px 0; min-height: 24px; }
+  a { color: #38bdf8; word-break: break-all; }
+  .err { color: #f87171; }
+  #list { text-align: left; margin-top: 30px; }
+  .item {
+    display: flex; justify-content: space-between; align-items: center;
+    background: #1e293b; padding: 10px 14px; border-radius: 8px; margin-bottom: 8px;
+    gap: 10px;
+  }
+  .item small { color: #94a3b8; display: block; }
+  .item button {
+    background: #334155; color: #e2e8f0; padding: 6px 12px; font-size: 13px;
+  }
+  .item button:hover { background: #ef4444; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>Quick Host</h1>
+  <div id="drop">
+    <button id="btn">Upload</button>
+    <p class="hint">ZIP oder HTML-Datei auswählen oder hierher ziehen</p>
+  </div>
+  <input type="file" id="file" accept=".zip,.html,.htm" hidden>
+  <div id="status"></div>
+  <div id="list"></div>
+  <p class="hint">Alles läuft lokal in deinem Browser. Es wird nichts hochgeladen.</p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script>
+const BASE = location.pathname.replace(/[^/]*$/, ''); // z.B. /repo/
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+
+// ---------- IndexedDB ----------
+const dbp = new Promise((res, rej) => {
+  const r = indexedDB.open('quickhost', 1);
+  r.onupgradeneeded = () => {
+    r.result.createObjectStore('files');  // key: "<id>/<pfad>"
+    r.result.createObjectStore('sites');  // key: id
+  };
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+async function tx(stores, mode, fn) {
+  const db = await dbp;
+  return new Promise((res, rej) => {
+    const t = db.transaction(stores, mode);
+    const out = fn(t);
+    t.oncomplete = () => res(out);
+    t.onerror = () => rej(t.error);
+  });
+}
+const idbGetAll = (store) => new Promise(async (res) => {
+  const db = await dbp;
+  const out = [];
+  db.transaction(store).objectStore(store).openCursor().onsuccess = e => {
+    const c = e.target.result;
+    if (c) { out.push({ key: c.key, value: c.value }); c.continue(); }
+    else res(out);
+  };
+});
+
+// ---------- Service Worker ----------
+async function initSW() {
+  if (!('serviceWorker' in navigator)) {
+    setStatus('Dein Browser unterstützt keine Service Worker.', true);
+    return;
+  }
+  const reg = await navigator.serviceWorker.register(BASE + 'sw.js', { scope: BASE });
+  await navigator.serviceWorker.ready;
+  if (!navigator.serviceWorker.controller) {
+    // Erstes Laden: einmal neu laden, damit der SW die Seite kontrolliert
+    location.reload();
+  }
+}
+
+const esc = s => String(s).replace(/[&<>"']/g, c => '&#' + c.charCodeAt(0) + ';');
+
+function setStatus(msg, err) {
+  statusEl.className = err ? 'err' : '';
+  statusEl.innerHTML = msg;
+}
+
+// ---------- Upload ----------
+const MIME = {
+  html:'text/html', htm:'text/html', css:'text/css', js:'text/javascript',
+  mjs:'text/javascript', json:'application/json', png:'image/png',
+  jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', svg:'image/svg+xml',
+  webp:'image/webp', ico:'image/x-icon', txt:'text/plain', xml:'application/xml',
+  woff:'font/woff', woff2:'font/woff2', ttf:'font/ttf', otf:'font/otf',
+  mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', mp4:'video/mp4',
+  webm:'video/webm', wasm:'application/wasm', pdf:'application/pdf',
+  map:'application/json', csv:'text/csv'
+};
+const mimeOf = p => MIME[(p.split('.').pop() || '').toLowerCase()] || 'application/octet-stream';
+
+async function handleFile(f) {
+  try {
+    setStatus('Verarbeite …');
+    const id = Math.random().toString(16).slice(2, 10);
+    const entries = []; // {path, blob}
+    const name = f.name.toLowerCase();
+
+    if (name.endsWith('.zip')) {
+      const zip = await JSZip.loadAsync(f);
+      for (const [path, file] of Object.entries(zip.files)) {
+        if (file.dir || path.startsWith('__MACOSX/') || path.split('/').pop() === '.DS_Store') continue;
+        const blob = await file.async('blob');
+        entries.push({ path, blob: new Blob([blob], { type: mimeOf(path) }) });
+      }
+      // Einzelnen umschließenden Ordner entfernen
+      const tops = new Set(entries.map(e => e.path.split('/')[0]));
+      if (tops.size === 1 && entries.every(e => e.path.includes('/'))) {
+        entries.forEach(e => e.path = e.path.split('/').slice(1).join('/'));
+      }
+      if (!entries.some(e => e.path === 'index.html'))
+        throw new Error('Im ZIP fehlt eine index.html im Hauptverzeichnis');
+    } else if (name.endsWith('.html') || name.endsWith('.htm')) {
+      entries.push({ path: 'index.html', blob: new Blob([f], { type: 'text/html' }) });
+    } else {
+      throw new Error('Nur .zip, .html oder .htm erlaubt');
+    }
+
+    await tx(['files', 'sites'], 'readwrite', t => {
+      entries.forEach(e => t.objectStore('files').put(e.blob, id + '/' + e.path));
+      t.objectStore('sites').put({ id, name: f.name, date: Date.now(), count: entries.length }, id);
+    });
+
+    const url = BASE + 'p/' + id + '/';
+    setStatus('Fertig! <a href="' + url + '" target="_blank">' + location.origin + url + '</a>');
+    renderList();
+  } catch (e) {
+    setStatus('Fehler: ' + esc(e.message), true);
+  }
+}
+
+// ---------- Liste ----------
+async function renderList() {
+  const sites = (await idbGetAll('sites')).map(x => x.value).sort((a, b) => b.date - a.date);
+  const list = $('list');
+  list.innerHTML = sites.length ? '<h3>Gehostete Projekte</h3>' : '';
+  sites.forEach(s => {
+    const url = BASE + 'p/' + s.id + '/';
+    const div = document.createElement('div');
+    div.className = 'item';
+    div.innerHTML = '<div><a href="' + url + '" target="_blank">' + esc(s.name) +
+      '</a><small>' + s.count + ' Dateien · ' + new Date(s.date).toLocaleString('de-DE') + '</small></div>';
+    const del = document.createElement('button');
+    del.textContent = 'Löschen';
+    del.onclick = () => removeSite(s.id);
+    div.appendChild(del);
+    list.appendChild(div);
+  });
+}
+async function removeSite(id) {
+  const keys = (await idbGetAll('files')).map(x => x.key).filter(k => k.startsWith(id + '/'));
+  await tx(['files', 'sites'], 'readwrite', t => {
+    keys.forEach(k => t.objectStore('files').delete(k));
+    t.objectStore('sites').delete(id);
+  });
+  renderList();
+}
+
+// ---------- UI ----------
+$('btn').onclick = () => $('file').click();
+$('file').onchange = e => { e.target.files[0] && handleFile(e.target.files[0]); e.target.value = ''; };
+const drop = $('drop');
+['dragenter','dragover'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', ev => ev.dataTransfer.files[0] && handleFile(ev.dataTransfer.files[0]));
+
+initSW().then(renderList);
+</script>
+</body>
+</html>
